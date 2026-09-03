@@ -44,6 +44,8 @@ Examples:
 
 var uploadsLinearURLPattern = regexp.MustCompile(`https://uploads\.linear\.app/[^\s<>"'\)\]]+`)
 
+const maxAttachmentDownloadBytes int64 = 256 << 20
+
 type issueAttachmentEntry struct {
 	ID     string `json:"id,omitempty"`
 	Title  string `json:"title"`
@@ -970,7 +972,6 @@ func isUnsetValue(value string) bool {
 		return false
 	}
 }
-
 
 func findProjectByNameOrID(projects []api.Project, value string) *api.Project {
 	normalized := strings.TrimSpace(value)
@@ -2032,17 +2033,36 @@ func downloadIssueAttachmentEntries(ctx context.Context, authHeader string, entr
 	return results, nil
 }
 
+// downloadAttachmentEntry validates the Linear upload origin before issuing any
+// request. Redirect validation preserves the same origin boundary on every hop.
 func downloadAttachmentEntry(ctx context.Context, authHeader string, entry issueAttachmentEntry, outputDir, outputPath string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, entry.URL, nil)
+	attachmentURL, err := validateAttachmentDownloadURL(entry.URL)
 	if err != nil {
 		return "", err
 	}
-	if shouldSendAttachmentAuthHeader(entry.URL) {
-		req.Header.Set("Authorization", authHeader)
+
+	return downloadAttachmentEntryWithClient(
+		ctx,
+		newAttachmentHTTPClient(),
+		attachmentURL,
+		authHeader,
+		entry,
+		outputDir,
+		outputPath,
+		maxAttachmentDownloadBytes,
+	)
+}
+
+// downloadAttachmentEntryWithClient writes one pre-validated attachment URL to
+// disk while enforcing maxBytes. The caller owns URL and redirect validation.
+func downloadAttachmentEntryWithClient(ctx context.Context, client *http.Client, attachmentURL *url.URL, authHeader string, entry issueAttachmentEntry, outputDir, outputPath string, maxBytes int64) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, attachmentURL.String(), nil)
+	if err != nil {
+		return "", err
 	}
+	req.Header.Set("Authorization", authHeader)
 	req.Header.Set("User-Agent", "linctl/0.1.0")
 
-	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -2068,11 +2088,25 @@ func downloadAttachmentEntry(ctx context.Context, authHeader string, entry issue
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = file.Close() }()
+	complete := false
+	defer func() {
+		_ = file.Close()
+		if !complete {
+			_ = os.Remove(targetPath)
+		}
+	}()
 
-	if _, err := io.Copy(file, resp.Body); err != nil {
+	written, err := io.Copy(file, io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
 		return "", err
 	}
+	if written > maxBytes {
+		return "", fmt.Errorf("attachment exceeds maximum size of %d bytes", maxBytes)
+	}
+	if err := file.Close(); err != nil {
+		return "", err
+	}
+	complete = true
 
 	absPath, err := filepath.Abs(targetPath)
 	if err != nil {
@@ -2081,14 +2115,38 @@ func downloadAttachmentEntry(ctx context.Context, authHeader string, entry issue
 	return absPath, nil
 }
 
-func shouldSendAttachmentAuthHeader(rawURL string) bool {
+// validateAttachmentDownloadURL permits only HTTPS downloads from Linear's
+// upload origin. This is the network egress and credential origin boundary.
+func validateAttachmentDownloadURL(rawURL string) (*url.URL, error) {
 	parsed, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
-		return false
+		return nil, fmt.Errorf("invalid attachment URL: %w", err)
 	}
-	return strings.EqualFold(parsed.Host, "uploads.linear.app")
+	host := strings.ToLower(parsed.Host)
+	if parsed.Scheme != "https" {
+		return nil, fmt.Errorf("attachment URL host %q requires https", host)
+	}
+	if host != "uploads.linear.app" {
+		return nil, fmt.Errorf("attachment URL host %q is not allowed", host)
+	}
+	return parsed, nil
 }
 
+// newAttachmentHTTPClient returns a client that applies the attachment origin
+// policy to every redirect before the redirected request is sent.
+func newAttachmentHTTPClient() *http.Client {
+	return &http.Client{
+		CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+			if _, err := validateAttachmentDownloadURL(req.URL.String()); err != nil {
+				return fmt.Errorf("attachment redirect rejected: %w", err)
+			}
+			return nil
+		},
+	}
+}
+
+// resolveDownloadFilename derives a safe leaf filename from response metadata,
+// the attachment title, or its URL without allowing directory traversal.
 func resolveDownloadFilename(resp *http.Response, entry issueAttachmentEntry) string {
 	if resp != nil {
 		if disposition := strings.TrimSpace(resp.Header.Get("Content-Disposition")); disposition != "" {
@@ -2116,11 +2174,13 @@ func resolveDownloadFilename(resp *http.Response, entry issueAttachmentEntry) st
 	return "attachment"
 }
 
+// sanitizeFilename reduces API-provided names to safe local leaf names. Empty
+// names and path traversal sentinels are rejected at this filesystem boundary.
 func sanitizeFilename(name string) string {
 	clean := strings.TrimSpace(name)
 	clean = strings.Trim(clean, "\"'")
 	clean = filepath.Base(clean)
-	if clean == "." || clean == "/" || clean == "" {
+	if clean == "" || clean == "." || clean == ".." {
 		return ""
 	}
 	clean = strings.Map(func(r rune) rune {

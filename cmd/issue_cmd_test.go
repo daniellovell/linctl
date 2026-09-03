@@ -6,7 +6,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -303,38 +305,85 @@ func TestHasAttachmentDownloadFailuresIgnoresSkipped(t *testing.T) {
 	}
 }
 
-func TestDownloadAttachmentEntryDoesNotSendAuthToExternalURL(t *testing.T) {
-	var sawAuth string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sawAuth = r.Header.Get("Authorization")
-		w.Header().Set("Content-Disposition", `attachment; filename="external.txt"`)
-		_, _ = w.Write([]byte("file contents"))
-	}))
-	defer server.Close()
+func TestValidateAttachmentURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		rawURL  string
+		wantErr bool
+	}{
+		{name: "Linear HTTPS upload", rawURL: "https://uploads.linear.app/x"},
+		{name: "Linear HTTP upload", rawURL: "http://uploads.linear.app/x", wantErr: true},
+		{name: "external host", rawURL: "https://evil.example/x", wantErr: true},
+		{name: "deceptive subdomain", rawURL: "https://uploads.linear.app.evil.example/x", wantErr: true},
+	}
 
-	outputDir := t.TempDir()
-	filePath, err := downloadAttachmentEntry(context.Background(), "linear-secret", issueAttachmentEntry{
-		Title:  "external.txt",
-		URL:    server.URL + "/external.txt",
-		Source: "attachment",
-	}, outputDir, "")
-	if err != nil {
-		t.Fatalf("downloadAttachmentEntry returned error: %v", err)
-	}
-	if sawAuth != "" {
-		t.Fatalf("expected no Authorization header for external URL, got %q", sawAuth)
-	}
-	if _, err := os.Stat(filePath); err != nil {
-		t.Fatalf("expected downloaded file at %s: %v", filePath, err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := validateAttachmentDownloadURL(tt.rawURL)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateAttachmentDownloadURL(%q) error = %v, wantErr %t", tt.rawURL, err, tt.wantErr)
+			}
+		})
 	}
 }
 
-func TestShouldSendAttachmentAuthHeaderOnlyForLinearUploads(t *testing.T) {
-	if !shouldSendAttachmentAuthHeader("https://uploads.linear.app/path/file.md") {
-		t.Fatalf("expected auth header for uploads.linear.app")
+func TestAttachmentClientRejectsExternalRedirect(t *testing.T) {
+	redirectURL, err := url.Parse("https://evil.example/attachment")
+	if err != nil {
+		t.Fatalf("parse redirect URL: %v", err)
 	}
-	if shouldSendAttachmentAuthHeader("https://example.com/path/file.md") {
-		t.Fatalf("expected no auth header for external host")
+	err = newAttachmentHTTPClient().CheckRedirect(&http.Request{URL: redirectURL}, nil)
+	if err == nil {
+		t.Fatal("expected external redirect to be rejected")
+	}
+}
+
+func TestDownloadAttachmentEntryWithClientRejectsOversizedBody(t *testing.T) {
+	const testLimit int64 = 1024
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Disposition", `attachment; filename="oversized.bin"`)
+		_, _ = io.CopyN(w, strings.NewReader(strings.Repeat("x", int(testLimit+1))), testLimit+1)
+	}))
+	defer server.Close()
+
+	attachmentURL, err := url.Parse(server.URL + "/oversized.bin")
+	if err != nil {
+		t.Fatalf("parse test server URL: %v", err)
+	}
+	outputDir := t.TempDir()
+	_, err = downloadAttachmentEntryWithClient(context.Background(), server.Client(), attachmentURL, "", issueAttachmentEntry{
+		Title:  "oversized.bin",
+		URL:    attachmentURL.String(),
+		Source: "attachment",
+	}, outputDir, "", testLimit)
+	if err == nil || !strings.Contains(err.Error(), "exceeds maximum size") {
+		t.Fatalf("expected size-limit error, got %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(outputDir, "oversized.bin")); !os.IsNotExist(statErr) {
+		t.Fatalf("expected partial file to be removed, stat error = %v", statErr)
+	}
+}
+
+func TestSanitizeFilename(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "plain filename", input: "report.pdf", want: "report.pdf"},
+		{name: "parent path", input: "../secret.txt", want: "secret.txt"},
+		{name: "absolute path", input: "/tmp/report.pdf", want: "report.pdf"},
+		{name: "empty name", input: "", want: ""},
+		{name: "current directory", input: ".", want: ""},
+		{name: "parent directory", input: "..", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sanitizeFilename(tt.input); got != tt.want {
+				t.Fatalf("sanitizeFilename(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
 	}
 }
 
