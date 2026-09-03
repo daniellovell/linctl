@@ -353,10 +353,10 @@ var teamStateListCmd = &cobra.Command{
 }
 
 var teamStateUpdateCmd = &cobra.Command{
-	Use:     "update STATE-ID",
-	Short:   "Update a workflow state",
-	Long:    `Update an existing workflow state's name, color, or description.`,
-	Args:    cobra.ExactArgs(1),
+	Use:   "update STATE-ID",
+	Short: "Update a workflow state",
+	Long:  `Update an existing workflow state's name, color, or description.`,
+	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		plaintext := viper.GetBool("plaintext")
 		jsonOut := viper.GetBool("json")

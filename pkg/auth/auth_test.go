@@ -127,6 +127,59 @@ func TestGetAuthHeaderReadsFirstPassLineWithOptionTerminator(t *testing.T) {
 	}
 }
 
+func TestSaveAuthRepairsExistingFilePermissions(t *testing.T) {
+	home := withTempHome(t)
+	configPath := filepath.Join(home, ".linctl-auth.json")
+	if err := os.WriteFile(configPath, []byte(`{"api_key":"old-key"}`), 0644); err != nil {
+		t.Fatalf("create permissive auth file: %v", err)
+	}
+
+	if err := saveAuth(AuthConfig{APIKey: "new-key"}); err != nil {
+		t.Fatalf("saveAuth: %v", err)
+	}
+
+	info, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatalf("stat auth file: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf("auth file mode = %04o, want 0600", got)
+	}
+}
+
+func TestReadAPIKeyUsesNoEchoReaderForTerminal(t *testing.T) {
+	defer writeStdin(t, "")()
+	originalIsTerminal := stdinIsTerminal
+	originalReadPassword := readTerminalPassword
+	t.Cleanup(func() {
+		stdinIsTerminal = originalIsTerminal
+		readTerminalPassword = originalReadPassword
+	})
+
+	stdinIsTerminal = func(fd int) bool {
+		return fd == int(os.Stdin.Fd())
+	}
+	passwordRead := false
+	readTerminalPassword = func(fd int) ([]byte, error) {
+		if fd != int(os.Stdin.Fd()) {
+			t.Fatalf("password reader received fd %d, want %d", fd, os.Stdin.Fd())
+		}
+		passwordRead = true
+		return []byte("new-key"), nil
+	}
+
+	got, err := readAPIKey()
+	if err != nil {
+		t.Fatalf("readAPIKey: %v", err)
+	}
+	if !passwordRead {
+		t.Fatal("expected terminal password reader to be called")
+	}
+	if got != "new-key" {
+		t.Fatalf("readAPIKey returned %q, want new-key", got)
+	}
+}
+
 func TestLoginWithPassRemovesLegacyConfig(t *testing.T) {
 	home := withTempHome(t)
 	t.Setenv("LINCTL_PASS_NAME", "linear-api-key")

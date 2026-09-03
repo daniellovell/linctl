@@ -14,6 +14,7 @@ import (
 
 	"github.com/dorkitude/linctl/pkg/api"
 	"github.com/fatih/color"
+	"golang.org/x/term"
 )
 
 // passEntryName returns the pass entry name to use, or "" if pass storage
@@ -28,6 +29,9 @@ var runPassCommand = func(stdin io.Reader, args ...string) ([]byte, error) {
 	cmd.Stdin = stdin
 	return cmd.CombinedOutput()
 }
+
+var stdinIsTerminal = term.IsTerminal
+var readTerminalPassword = term.ReadPassword
 
 func readFromPass(name string) (string, error) {
 	out, err := runPassCommand(nil, "show", "--", name)
@@ -82,7 +86,7 @@ type AuthConfig struct {
 	APIKey string `json:"api_key,omitempty"`
 }
 
-// getConfigPath returns the path to the auth config file
+// getConfigPath returns the user-scoped path for the credential file.
 func getConfigPath() (string, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -91,11 +95,29 @@ func getConfigPath() (string, error) {
 	return filepath.Join(homeDir, ".linctl-auth.json"), nil
 }
 
-// saveAuth saves authentication credentials
+// saveAuth writes credentials to a user-only file and repairs permissions on
+// existing files. A parent directory created here receives user-only access.
 func saveAuth(config AuthConfig) error {
 	configPath, err := getConfigPath()
 	if err != nil {
 		return err
+	}
+
+	parentDir := filepath.Dir(configPath)
+	parentCreated := false
+	if _, err := os.Stat(parentDir); err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+		if err := os.MkdirAll(parentDir, 0700); err != nil {
+			return err
+		}
+		parentCreated = true
+	}
+	if parentCreated {
+		if err := os.Chmod(parentDir, 0700); err != nil {
+			return err
+		}
 	}
 
 	data, err := json.MarshalIndent(config, "", "  ")
@@ -103,7 +125,10 @@ func saveAuth(config AuthConfig) error {
 		return err
 	}
 
-	return os.WriteFile(configPath, data, 0600)
+	if err := os.WriteFile(configPath, data, 0600); err != nil {
+		return err
+	}
+	return os.Chmod(configPath, 0600)
 }
 
 func removeAuthConfig() error {
@@ -170,12 +195,32 @@ func GetAuthHeader() (string, error) {
 	return "", fmt.Errorf("no valid authentication found")
 }
 
-// Login handles the authentication flow
+// Login authenticates with a Personal API Key read from standard input.
 func Login(plaintext, jsonOut bool) error {
 	return loginWithAPIKey(plaintext, jsonOut)
 }
 
-// loginWithAPIKey handles Personal API Key authentication
+// readAPIKey disables terminal echo for interactive input and preserves pipe
+// input for automation. Standard input is the credential disclosure boundary.
+func readAPIKey() (string, error) {
+	if stdinIsTerminal(int(os.Stdin.Fd())) {
+		value, err := readTerminalPassword(int(os.Stdin.Fd()))
+		fmt.Println()
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(value)), nil
+	}
+
+	value, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	return strings.TrimSpace(value), nil
+}
+
+// loginWithAPIKey verifies and stores a Personal API Key without echoing
+// terminal input. Piped input remains available for non-interactive login.
 func loginWithAPIKey(plaintext, jsonOut bool) error {
 	if !plaintext && !jsonOut {
 		fmt.Println("\n" + color.New(color.FgYellow).Sprint("📝 Personal API Key Authentication"))
@@ -192,12 +237,10 @@ func loginWithAPIKey(plaintext, jsonOut bool) error {
 		fmt.Print("\nEnter your Personal API Key: ")
 	}
 
-	reader := bufio.NewReader(os.Stdin)
-	apiKey, err := reader.ReadString('\n')
+	apiKey, err := readAPIKey()
 	if err != nil {
 		return err
 	}
-	apiKey = strings.TrimSpace(apiKey)
 
 	if apiKey == "" {
 		return fmt.Errorf("API key cannot be empty")
