@@ -1,0 +1,17 @@
+{
+  "name": "linctl-pi",
+  "version": "0.1.0",
+  "description": "Pi package for linctl: a single `linear` tool wrapping the linctl CLI with forced JSON output and confirmed writes.",
+  "type": "module",
+  "private": true,
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}
