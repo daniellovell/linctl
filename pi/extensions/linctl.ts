@@ -11,8 +11,11 @@
  *   deliberately instead of guessing shell invocations.
  * - `--json --plaintext` forced on every call, so output is parseable and no
  *   interactive prompt can hang the agent.
- * - A single choke point for Linear writes: mutating subcommands require the
- *   user to confirm in the pi UI, and are refused when no UI is present.
+ * - A single choke point for destructive Linear writes: subcommands that
+ *   delete or detach data require the user to confirm in the pi UI, and are
+ *   refused when no UI is present. Additive writes (create, update, comment,
+ *   assign) run without a prompt: they are visible in Linear and reversible,
+ *   and the operator chose fewer interruptions over a gate on each one.
  * - `auth` is never reachable from the agent. Credentials are configured by
  *   the operator with `linctl auth` in a terminal.
  *
@@ -25,33 +28,22 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 /**
- * linctl subcommand verbs that change Linear state or the local filesystem.
- * Any occurrence anywhere in argv marks the call as a write, which errs toward
- * confirmation: `issue relation add`, `team state update`, and
- * `issue attachment download` all match through their leaf verb.
+ * linctl subcommand verbs that destroy or detach Linear data. Any occurrence
+ * anywhere in argv marks the call as destructive, so `issue relation remove`
+ * and `comment delete` match through their leaf verb. Raw GraphQL mutations
+ * (`mcp call mutation.*`) also match, since their effect cannot be classified
+ * from the argv.
  */
-const MUTATING_VERBS = new Set([
-	"create",
-	"update",
-	"delete",
-	"archive",
-	"assign",
-	"attach",
-	"add",
-	"remove",
-	"mention",
-	"download",
-	"sync",
-]);
+const DESTRUCTIVE_VERBS = new Set(["delete", "archive", "remove"]);
 
 /** Forced on every call. Global linctl flags, valid after any subcommand. */
 const FORCED_FLAGS = ["--json", "--plaintext"];
 
 const TIMEOUT_MS = 60_000;
 
-/** Reports whether a linctl argv performs a write. */
-export function isMutation(args: string[]): boolean {
-	return args.some((a) => MUTATING_VERBS.has(a) || a.startsWith("mutation."));
+/** Reports whether a linctl argv performs a destructive write. */
+export function isDestructive(args: string[]): boolean {
+	return args.some((a) => DESTRUCTIVE_VERBS.has(a) || a.startsWith("mutation."));
 }
 
 export default function (pi: ExtensionAPI) {
@@ -62,7 +54,7 @@ export default function (pi: ExtensionAPI) {
 			"Run linctl against Linear. Pass the argv without the binary name, for example " +
 			'["issue","get","ENG-80"] or ["issue","list","--assignee","me"]. ' +
 			`${FORCED_FLAGS.join(" ")} are appended to every call, so output is JSON. ` +
-			"Writes (create, update, delete, assign, comment create, relation add, ...) ask the user to confirm. " +
+			"Destructive writes (delete, archive, remove, raw mutations) ask the user to confirm; other writes run directly. " +
 			"The auth subcommand is not available. " +
 			`Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}; narrow the query with filters or --limit when that happens. ` +
 			"See the linctl skill for the command map, default filters, and gotchas.",
@@ -86,11 +78,11 @@ export default function (pi: ExtensionAPI) {
 				throw new Error("linear: the auth subcommand is operator-only; run `linctl auth` in a terminal");
 			}
 			const command = `linctl ${args.join(" ")}`;
-			if (isMutation(args)) {
+			if (isDestructive(args)) {
 				if (!ctx.hasUI) {
-					throw new Error(`linear: ${command} is a write and no UI is available to confirm it`);
+					throw new Error(`linear: ${command} is destructive and no UI is available to confirm it`);
 				}
-				const ok = await ctx.ui.confirm("Linear write", command);
+				const ok = await ctx.ui.confirm("Linear destructive write", command);
 				if (!ok) {
 					throw new Error(`linear: user declined ${command}`);
 				}
@@ -115,7 +107,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			return {
 				content: [{ type: "text", text }],
-				details: { args, mutation: isMutation(args), truncated: truncation.truncated },
+				details: { args, destructive: isDestructive(args), truncated: truncation.truncated },
 			};
 		},
 

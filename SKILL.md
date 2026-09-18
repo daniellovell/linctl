@@ -9,7 +9,7 @@ Use this skill when the user wants to inspect or modify Linear data through `lin
 
 ## Quick Rules
 
-- In pi, a `linear` tool wraps linctl (argv without the binary, `--json --plaintext` forced, writes confirmed by the user). Prefer it over bash for linctl calls. Auth is operator-only there, so verify with `["whoami"]`.
+- In pi, a `linear` tool wraps linctl (argv without the binary, `--json --plaintext` forced, destructive writes such as delete and remove confirmed by the user, other writes run directly). Prefer it over bash for linctl calls. Auth is operator-only there, so verify with `["whoami"]`.
 - Always verify auth before substantive work: `linctl auth status` or `linctl whoami`.
 - For read operations, prefer `--json` and parse results with `jq` when needed.
 - Before writing, inspect current state first (`get` / `list --json`).
